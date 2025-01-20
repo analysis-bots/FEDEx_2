@@ -32,7 +32,7 @@ class Filter(Operation.Operation):
     """
 
     def __init__(self, source_df: DataFrame, source_scheme: dict, attribute: str = None,
-                 operation_str: str = None, value=None, result_df: DataFrame = None):
+                 operation_str: str = None, value=None, result_df: DataFrame = None, use_sampling: bool = True):
         """
         :param source_df: The source DataFrame, before the filter operation.
         :param source_scheme: The scheme of the source DataFrame.
@@ -40,6 +40,8 @@ class Filter(Operation.Operation):
         :param operation_str: The operation to perform. Only needed if result_df is None.
         :param value: The value to filter by. Only needed if result_df is None.
         :param result_df: The resulting DataFrame after the filter operation.
+        :param use_sampling: Whether to use sampling to speed up the generation of explanations. Note that this may
+        affect the accuracy and quality of the explanations. Default is True.
         """
         super().__init__(source_scheme)
         self.source_df = source_df.reset_index()
@@ -58,7 +60,16 @@ class Filter(Operation.Operation):
         else:
             self.result_df = result_df
             self.result_name = utils.get_calling_params_name(result_df)
+
+        if use_sampling:
+            # If sampling is used, we want to have a backup of the original source and result DataFrames, for
+            # any potential future need of them.
+            self.unsampled_source_df = source_df
+            self.unsampled_result_df = self.result_df
+            self.source_df = self.sample(self.source_df)
+            self.result_df = self.sample(self.result_df)
         self.source_name = utils.get_calling_params_name(source_df)
+        self._high_correlated_columns = None
 
     def get_correlated_attributes(self) -> List[str]:
         """
@@ -70,8 +81,12 @@ class Filter(Operation.Operation):
 
         :return: A list of attributes that are highly correlated with the specified attribute.
         """
-        # For performance, we only take the first 10000 rows.
-        numeric_df = self.source_df.head(10000)
+        # Avoid repeating the calculation every single time.
+        if self._high_correlated_columns is not None:
+            return self._high_correlated_columns
+        # For performance, we only take the first 10000 rows. We also copy the df because otherwise we
+        # are modifying the original df.
+        numeric_df = self.source_df.head(10000).copy()
 
         # For every non-numeric column, we map it to a numeric value by sorting the unique values and assigning
         # them a number.
@@ -82,7 +97,9 @@ class Filter(Operation.Operation):
 
                 items = sorted(numeric_df[column].dropna().unique())
                 items_map = dict(zip(items, range(len(items))))
-                numeric_df[column] = numeric_df[column].map(items_map)
+                # Changed from numeric_df[column] = numeric_df[column].map(items_map) to avoid SettingWithCopyWarning
+                # and future deprecation.
+                numeric_df.loc[:, column] = numeric_df[column].map(items_map)
             except Exception as e:
                 print(e)
 
@@ -93,6 +110,8 @@ class Filter(Operation.Operation):
 
             df = df[df > 0.85].dropna()
             high_correlated_columns = list(df.index)
+
+        self._high_correlated_columns = high_correlated_columns
 
         return high_correlated_columns
 
@@ -162,6 +181,10 @@ class Filter(Operation.Operation):
         if schema is None:
             schema = {}
 
+        # if use_sampling:
+        #     source_df_backup, result_df_backup = self.source_df, self.result_df
+        #     self.source_df, self.result_df = self.sample(self.source_df), self.sample(self.result_df)
+
         # The measure used for filer operations is always the ExceptionalityMeasure.
         measure = ExceptionalityMeasure()
         scores = measure.calc_measure(self, schema, attributes)
@@ -173,6 +196,9 @@ class Filter(Operation.Operation):
                                          show_scores=show_scores, title=title)
         if figures:
             self.correlated_notes(figures, top_k)
+
+        # if use_sampling:
+        #     self.source_df, self.result_df = source_df_backup, result_df_backup
         return None
 
     def present_deleted_correlated(self, figs_in_row: int = DEFAULT_FIGS_IN_ROW):
